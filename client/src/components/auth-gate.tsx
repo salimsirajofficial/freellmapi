@@ -100,10 +100,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
   })
 
   useEffect(() => {
-    const handler = () => { refetch() }
+    const handler = () => {
+      // Invalidate the cache first so stale authenticated:true data is cleared
+      // immediately — otherwise React Query may return cached data while the
+      // refetch is in-flight, keeping the dashboard visible after logout.
+      queryClient.invalidateQueries({ queryKey: ['auth-status'] })
+      refetch()
+    }
     window.addEventListener(UNAUTHORIZED_EVENT, handler)
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, handler)
-  }, [refetch])
+  }, [refetch, queryClient])
 
   function onAuthed() {
     // New session: drop any cached (unauthenticated) data and re-check status.
