@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { initEncryptionKey } from '../lib/crypto.js';
 import { applyModelPricing } from './model-pricing.js';
+import { startPostgresSync } from './postgres-sync.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
@@ -63,6 +64,7 @@ export function initDb(dbPath?: string): Database.Database {
   applyModelPricing(db);
   migrateEmbeddingsV1(db);
   ensureUnifiedKey(db);
+  startPostgresSync(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
   return db;

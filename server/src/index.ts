@@ -1,6 +1,7 @@
 import './env.js';
 import { createApp } from './app.js';
 import { initDb } from './db/index.js';
+import { restoreDbFromPostgres } from './db/postgres-sync.js';
 import { startHealthChecker } from './services/health.js';
 
 const PORT = process.env.PORT ?? 3001;
@@ -10,6 +11,7 @@ const PORT = process.env.PORT ?? 3001;
 const HOST = process.env.HOST ?? '::';
 
 async function main() {
+  await restoreDbFromPostgres();
   initDb();
   const app = createApp();
 
