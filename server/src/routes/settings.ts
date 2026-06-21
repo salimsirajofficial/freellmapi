@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getUnifiedApiKey, regenerateUnifiedKey } from '../db/index.js';
+import { getDb, getUnifiedApiKey, regenerateUnifiedKey } from '../db/index.js';
+import { backupDbToPostgres } from '../db/postgres-sync.js';
 
 export const settingsRouter = Router();
 
@@ -10,7 +11,10 @@ settingsRouter.get('/api-key', (_req: Request, res: Response) => {
 });
 
 // Regenerate the unified API key
-settingsRouter.post('/api-key/regenerate', (_req: Request, res: Response) => {
+settingsRouter.post('/api-key/regenerate', async (_req: Request, res: Response) => {
   const newKey = regenerateUnifiedKey();
+  await backupDbToPostgres(getDb(), 'unified api key regenerate').catch((err: any) => {
+    console.error('[postgres-sync] Immediate backup after unified API key regenerate failed:', err?.message || err);
+  });
   res.json({ apiKey: newKey });
 });

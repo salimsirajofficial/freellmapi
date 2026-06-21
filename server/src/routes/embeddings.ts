@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb, setSetting } from '../db/index.js';
+import { backupDbToPostgres } from '../db/postgres-sync.js';
 import { listEmbeddingModels, getDefaultFamily, type EmbeddingModelRow } from '../services/embeddings.js';
 
 export const embeddingsRouter = Router();
@@ -53,7 +54,7 @@ const updateSchema = z.object({
   })).optional(),
 });
 
-embeddingsRouter.put('/', (req: Request, res: Response) => {
+embeddingsRouter.put('/', async (req: Request, res: Response) => {
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: 'Invalid request body' } });
@@ -78,6 +79,9 @@ embeddingsRouter.put('/', (req: Request, res: Response) => {
     apply(parsed.data.providers);
   }
 
+  await backupDbToPostgres(db, 'embeddings settings update').catch((err: any) => {
+    console.error('[postgres-sync] Immediate backup after embeddings settings update failed:', err?.message || err);
+  });
   res.json({ success: true });
 });
 

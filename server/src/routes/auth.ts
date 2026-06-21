@@ -9,6 +9,8 @@ import {
   validateSession,
   deleteSession,
 } from '../services/auth.js';
+import { getDb } from '../db/index.js';
+import { backupDbToPostgres } from '../db/postgres-sync.js';
 
 export const authRouter = Router();
 
@@ -63,7 +65,7 @@ authRouter.get('/status', (req: Request, res: Response) => {
 
 // First-run account creation. Only allowed while there are zero users, so it
 // can't be used to add accounts once the dashboard is claimed.
-authRouter.post('/setup', (req: Request, res: Response) => {
+authRouter.post('/setup', async (req: Request, res: Response) => {
   if (userCount() > 0) {
     res.status(409).json({ error: { message: 'Setup already completed. Use login instead.', type: 'setup_complete' } });
     return;
@@ -75,6 +77,9 @@ authRouter.post('/setup', (req: Request, res: Response) => {
   }
   const user = createUser(parsed.data.email, parsed.data.password);
   const token = createSession(user.userId);
+  await backupDbToPostgres(getDb(), 'auth setup').catch((err: any) => {
+    console.error('[postgres-sync] Immediate backup after auth setup failed:', err?.message || err);
+  });
   res.status(201).json({ token, email: user.email });
 });
 

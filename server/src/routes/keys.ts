@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { backupDbToPostgres } from '../db/postgres-sync.js';
 import { resolveProvider } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 
@@ -30,6 +31,12 @@ const updateKeySchema = z.object({
 }).refine(data => data.enabled !== undefined || data.label !== undefined, {
   message: 'At least one of enabled or label must be provided',
 });
+
+async function persistKeysChange(db: ReturnType<typeof getDb>, reason: string): Promise<void> {
+  await backupDbToPostgres(db, reason).catch((err: any) => {
+    console.error(`[postgres-sync] Immediate backup after ${reason} failed:`, err?.message || err);
+  });
+}
 
 // List all keys (masked)
 keysRouter.get('/', (_req: Request, res: Response) => {
@@ -61,7 +68,7 @@ keysRouter.get('/', (_req: Request, res: Response) => {
 });
 
 // Add a key
-keysRouter.post('/', (req: Request, res: Response) => {
+keysRouter.post('/', async (req: Request, res: Response) => {
   const parsed = addKeySchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
@@ -89,6 +96,7 @@ keysRouter.post('/', (req: Request, res: Response) => {
     const existing = db.prepare('SELECT id FROM api_keys WHERE platform = ? LIMIT 1').get(platform) as { id: number } | undefined;
     if (existing) {
       db.prepare("UPDATE api_keys SET enabled = 1, status = 'unknown' WHERE id = ?").run(existing.id);
+      await persistKeysChange(db, 'keyless provider update');
       res.status(200).json({
         id: existing.id,
         platform,
@@ -107,6 +115,7 @@ keysRouter.post('/', (req: Request, res: Response) => {
     VALUES (?, ?, ?, ?, ?, 'unknown', 1)
   `).run(platform, label ?? '', encrypted, iv, authTag);
 
+  await persistKeysChange(db, 'key insert');
   res.status(201).json({
     id: result.lastInsertRowid,
     platform,
@@ -132,7 +141,7 @@ const customProviderSchema = z.object({
   label: z.string().optional(),
 });
 
-keysRouter.post('/custom', (req: Request, res: Response) => {
+keysRouter.post('/custom', async (req: Request, res: Response) => {
   const parsed = customProviderSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
@@ -194,6 +203,7 @@ keysRouter.post('/custom', (req: Request, res: Response) => {
   });
 
   const { keyId, modelDbId } = upsert();
+  await persistKeysChange(db, 'custom provider upsert');
   res.status(201).json({
     success: true,
     keyId,
@@ -207,7 +217,7 @@ keysRouter.post('/custom', (req: Request, res: Response) => {
 });
 
 // Delete a key
-keysRouter.delete('/:id', (req: Request, res: Response) => {
+keysRouter.delete('/:id', async (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
   if (isNaN(id)) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
@@ -240,11 +250,12 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   });
   remove();
 
+  await persistKeysChange(db, 'key delete');
   res.json({ success: true });
 });
 
 // Toggle all keys for a platform
-keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
+keysRouter.patch('/platform/:platform', async (req: Request, res: Response) => {
   const platform = req.params.platform as string;
   if (!(PLATFORMS as readonly string[]).includes(platform)) {
     res.status(400).json({ error: { message: `Invalid platform '${platform}'` } });
@@ -260,11 +271,12 @@ keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
   const db = getDb();
   const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE platform = ?').run(enabled ? 1 : 0, platform);
 
+  await persistKeysChange(db, 'platform key update');
   res.json({ success: true, enabled, updatedKeys: result.changes });
 });
 
 // Update key (toggle enable/disable or edit label)
-keysRouter.patch('/:id', (req: Request, res: Response) => {
+keysRouter.patch('/:id', async (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
   if (isNaN(id)) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
@@ -300,6 +312,7 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
     return;
   }
 
+  await persistKeysChange(db, 'key update');
   const response: Record<string, unknown> = { success: true };
   if (enabled !== undefined) response.enabled = enabled;
   if (label !== undefined) response.label = label;

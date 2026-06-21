@@ -2,11 +2,18 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { backupDbToPostgres } from '../db/postgres-sync.js';
 import { getAllPenalties, getCustomWeights, getRoutingScores, getRoutingStrategy, setCustomWeights, setRoutingStrategy } from '../services/router.js';
 import { BANDIT_PRESETS, type RoutingStrategy } from '../services/scoring.js';
 import { parseBudget } from '../lib/budget.js';
 
 export const fallbackRouter = Router();
+
+async function persistFallbackChange(reason: string): Promise<void> {
+  await backupDbToPostgres(getDb(), reason).catch((err: any) => {
+    console.error(`[postgres-sync] Immediate backup after ${reason} failed:`, err?.message || err);
+  });
+}
 
 // ── Bandit routing strategy ─────────────────────────────────────────────────
 // GET  /routing → active strategy, preset weights, the saved custom weights,
@@ -32,7 +39,7 @@ const routingSchema = z.object({
 // PUT /routing → switch strategy. Presets are just weight vectors over the three
 // axes; 'custom' uses the user-saved vector; 'priority' falls back to the legacy
 // manual chain order.
-fallbackRouter.put('/routing', (req: Request, res: Response) => {
+fallbackRouter.put('/routing', async (req: Request, res: Response) => {
   const parsed = routingSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
@@ -42,6 +49,7 @@ fallbackRouter.put('/routing', (req: Request, res: Response) => {
     setCustomWeights(parsed.data.weights);
   }
   setRoutingStrategy(parsed.data.strategy as RoutingStrategy);
+  await persistFallbackChange('routing strategy update');
   res.json({ strategy: getRoutingStrategy(), presets: BANDIT_PRESETS, customWeights: getCustomWeights() });
 });
 
@@ -102,7 +110,7 @@ const updateSchema = z.array(z.object({
 }));
 
 // Update fallback chain (full replace)
-fallbackRouter.put('/', (req: Request, res: Response) => {
+fallbackRouter.put('/', async (req: Request, res: Response) => {
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
@@ -121,6 +129,7 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
   });
   updateAll();
 
+  await persistFallbackChange('fallback chain update');
   res.json({ success: true });
 });
 
@@ -140,7 +149,7 @@ const SORT_PRESETS: Record<string, string> = {
   budget: "CASE m.monthly_token_budget WHEN '~120M' THEN 1 WHEN '~50-100M' THEN 2 WHEN '~30M' THEN 3 WHEN '~18-45M' THEN 4 WHEN '~18M' THEN 5 WHEN '~15M' THEN 6 WHEN '~12M' THEN 7 WHEN '~6M' THEN 8 WHEN '~5-10M' THEN 9 WHEN '~4M' THEN 10 ELSE 11 END ASC",
 };
 
-fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
+fallbackRouter.post('/sort/:preset', async (req: Request, res: Response) => {
   const preset = String(req.params.preset);
   const orderBy = SORT_PRESETS[preset];
   if (!orderBy) {
@@ -159,6 +168,7 @@ fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
   });
   reorder();
 
+  await persistFallbackChange('fallback sort');
   res.json({ success: true, preset });
 });
 
