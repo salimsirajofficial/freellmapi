@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
-import { initDb } from '../../db/index.js';
+import { initDb, getDb } from '../../db/index.js';
 
 async function call(app: Express, method: string, path: string, body?: any, token?: string) {
   const server = app.listen(0);
@@ -51,6 +51,16 @@ describe('Dashboard auth (#35)', () => {
   it('rejects weak setup credentials', async () => {
     expect((await call(app, 'POST', '/api/auth/setup', { email: 'bad', password: 'x' })).status).toBe(400);
     expect((await call(app, 'POST', '/api/auth/setup', { email: 'a@b.com', password: 'short' })).status).toBe(400);
+  });
+
+  it('allows setup if only desktop@localhost exists', async () => {
+    const db = getDb();
+    db.prepare("INSERT INTO users (email, password_hash) VALUES ('desktop@localhost', 'somehash')").run();
+
+    const statusBefore = await call(app, 'GET', '/api/auth/status');
+    expect(statusBefore.body).toMatchObject({ needsSetup: true, authenticated: false });
+
+    db.prepare("DELETE FROM users WHERE email = 'desktop@localhost'").run();
   });
 
   let token = '';

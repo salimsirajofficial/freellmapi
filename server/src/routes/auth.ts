@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import {
   userCount,
+  hasNonDesktopUser,
   createUser,
   verifyCredentials,
   createSession,
@@ -57,7 +58,7 @@ function bearer(req: Request): string | undefined {
 authRouter.get('/status', (req: Request, res: Response) => {
   const session = validateSession(bearer(req));
   res.json({
-    needsSetup: userCount() === 0,
+    needsSetup: !hasNonDesktopUser(),
     authenticated: !!session,
     email: session?.email ?? null,
   });
@@ -66,7 +67,7 @@ authRouter.get('/status', (req: Request, res: Response) => {
 // First-run account creation. Only allowed while there are zero users, so it
 // can't be used to add accounts once the dashboard is claimed.
 authRouter.post('/setup', async (req: Request, res: Response) => {
-  if (userCount() > 0) {
+  if (hasNonDesktopUser()) {
     res.status(409).json({ error: { message: 'Setup already completed. Use login instead.', type: 'setup_complete' } });
     return;
   }
@@ -76,6 +77,7 @@ authRouter.post('/setup', async (req: Request, res: Response) => {
     return;
   }
   const user = createUser(parsed.data.email, parsed.data.password);
+  clearFailures(user.email);
   const token = createSession(user.userId);
   await backupDbToPostgres(getDb(), 'auth setup').catch((err: any) => {
     console.error('[postgres-sync] Immediate backup after auth setup failed:', err?.message || err);

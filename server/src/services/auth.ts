@@ -26,6 +26,11 @@ export function userCount(): number {
   return row.c;
 }
 
+export function hasNonDesktopUser(): boolean {
+  const row = getDb().prepare("SELECT 1 FROM users WHERE email != 'desktop@localhost' LIMIT 1").get();
+  return !!row;
+}
+
 /** Create a user. Throws { code: 'email_taken' } if the email already exists. */
 export function createUser(email: string, password: string): SessionUser {
   const db = getDb();

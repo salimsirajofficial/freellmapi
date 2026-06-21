@@ -40,8 +40,16 @@ export async function restoreDbFromPostgres(): Promise<void> {
     `);
 
     // Fetch the backup row
-    const res = await client.query('SELECT data FROM sqlite_backup WHERE id = 1');
+    const res = await client.query('SELECT data, updated_at FROM sqlite_backup WHERE id = 1');
     if (res.rows.length > 0) {
+      const postgresUpdatedAt = new Date(res.rows[0].updated_at).getTime();
+      const localMtime = getSqliteMtime();
+      if (localMtime > postgresUpdatedAt) {
+        console.log('[postgres-sync] Local SQLite database is newer than the Postgres backup. Skipping restore.');
+        lastBackupTime = localMtime;
+        return;
+      }
+
       console.log('[postgres-sync] Found SQLite backup in Supabase Postgres. Restoring...');
       const base64Data = res.rows[0].data;
       const compressedBuffer = Buffer.from(base64Data, 'base64');

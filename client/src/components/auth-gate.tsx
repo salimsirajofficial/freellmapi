@@ -301,30 +301,38 @@ function AuthPage({
 
         <div className="auth-card">
           {/* Tab strip */}
-          <div className="auth-tabs" ref={tabBarRef}>
-            <button
-              id="auth-tab-signup"
-              type="button"
-              className={`auth-tab${tab === 'signup' ? ' active' : ''}`}
-              onClick={() => setTab('signup')}
-              aria-selected={tab === 'signup'}
-            >
-              Create account
-            </button>
-            <button
-              id="auth-tab-login"
-              type="button"
-              className={`auth-tab${tab === 'login' ? ' active' : ''}`}
-              onClick={() => setTab('login')}
-              aria-selected={tab === 'login'}
-            >
-              Sign in
-            </button>
-            <div
-              className="auth-tab-indicator"
-              style={{ left: indicator.left, width: indicator.width }}
-            />
-          </div>
+          {needsSetup ? (
+            <div className="auth-tabs" ref={tabBarRef}>
+              <button
+                id="auth-tab-signup"
+                type="button"
+                className={`auth-tab${tab === 'signup' ? ' active' : ''}`}
+                onClick={() => setTab('signup')}
+                aria-selected={tab === 'signup'}
+              >
+                Create account
+              </button>
+              <button
+                id="auth-tab-login"
+                type="button"
+                className={`auth-tab${tab === 'login' ? ' active' : ''}`}
+                onClick={() => setTab('login')}
+                aria-selected={tab === 'login'}
+              >
+                Sign in
+              </button>
+              <div
+                className="auth-tab-indicator"
+                style={{ left: indicator.left, width: indicator.width }}
+              />
+            </div>
+          ) : (
+            <div className="auth-tabs" style={{ justifyContent: 'center' }}>
+              <div className="auth-tab active" style={{ cursor: 'default' }}>
+                Sign in
+              </div>
+            </div>
+          )}
 
           {/* Sliding panels */}
           <div className={`auth-panels${tab === 'login' ? ' show-login' : ''}`}>
