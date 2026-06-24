@@ -67,39 +67,49 @@ authRouter.get('/status', (req: Request, res: Response) => {
 // First-run account creation. Only allowed while there are zero users, so it
 // can't be used to add accounts once the dashboard is claimed.
 authRouter.post('/setup', async (req: Request, res: Response) => {
+  console.log('[AUTH-ROUTE] /setup called');
   if (hasNonDesktopUser()) {
+    console.log('[AUTH-ROUTE] /setup rejected: setup already completed');
     res.status(409).json({ error: { message: 'Setup already completed. Use login instead.', type: 'setup_complete' } });
     return;
   }
   const parsed = credentialsSchema.safeParse(req.body);
   if (!parsed.success) {
+    console.log('[AUTH-ROUTE] /setup validation failed:', parsed.error.errors.map(e => e.message).join(', '));
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
+  console.log('[AUTH-ROUTE] /setup creating user with email:', parsed.data.email);
   const user = createUser(parsed.data.email, parsed.data.password);
   clearFailures(user.email);
   const token = createSession(user.userId);
   await backupDbToPostgres(getDb(), 'auth setup').catch((err: any) => {
     console.error('[postgres-sync] Immediate backup after auth setup failed:', err?.message || err);
   });
+  console.log('[AUTH-ROUTE] /setup successful for email:', user.email);
   res.status(201).json({ token, email: user.email });
 });
 
 authRouter.post('/login', (req: Request, res: Response) => {
+  console.log('[AUTH-ROUTE] /login called');
   const parsed = credentialsSchema.safeParse(req.body);
   if (!parsed.success) {
+    console.log('[AUTH-ROUTE] /login validation failed:', parsed.error.errors.map(e => e.message).join(', '));
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
   const { email, password } = parsed.data;
+  console.log('[AUTH-ROUTE] /login attempting with email:', email);
 
   if (isLockedOut(email)) {
+    console.log('[AUTH-ROUTE] /login rejected: rate limit exceeded for email:', email);
     res.status(429).json({ error: { message: 'Too many failed attempts. Try again later.', type: 'rate_limit_error' } });
     return;
   }
 
   const user = verifyCredentials(email, password);
   if (!user) {
+    console.log('[AUTH-ROUTE] /login failed: invalid credentials for email:', email);
     recordFailure(email);
     // Same message whether the email exists or not — don't leak which.
     res.status(401).json({ error: { message: 'Invalid email or password', type: 'authentication_error' } });
@@ -108,6 +118,7 @@ authRouter.post('/login', (req: Request, res: Response) => {
 
   clearFailures(email);
   const token = createSession(user.userId);
+  console.log('[AUTH-ROUTE] /login successful for email:', user.email);
   res.json({ token, email: user.email });
 });
 
