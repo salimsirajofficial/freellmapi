@@ -1,267 +1,318 @@
-import { Router } from 'express';
+﻿import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getDb } from '../db/index.js';
-import { FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M } from '../db/model-pricing.js';
+import { getUserRequests } from '../db/supabase-queries.js';
 
 export const analyticsRouter = Router();
 
-// Format UTC timestamps the same way SQLite stores created_at text values.
-const toSqliteDateTime = (timestamp: number) =>
-    new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
+const FALLBACK_INPUT_PER_M = 5;
+const FALLBACK_OUTPUT_PER_M = 15;
 
-// Return the rolling cutoff timestamp for the selected analytics range.
-function getSinceTimestamp(range: string): string {
+function getSinceTimestamp(range: string): Date {
   const now = Date.now();
-
   switch (range) {
     case '24h':
-      return toSqliteDateTime(now - 24 * 60 * 60 * 1000);
+      return new Date(now - 24 * 60 * 60 * 1000);
     case '30d':
-      return toSqliteDateTime(now - 30 * 24 * 60 * 60 * 1000);
+      return new Date(now - 30 * 24 * 60 * 60 * 1000);
     case '7d':
     default:
-      return toSqliteDateTime(now - 7 * 24 * 60 * 60 * 1000);
+      return new Date(now - 7 * 24 * 60 * 60 * 1000);
   }
 }
 
-// Summary stats
-analyticsRouter.get('/summary', (req: Request, res: Response) => {
-  const range = (req.query.range as string) ?? '7d';
-  const since = getSinceTimestamp(range);
-  const db = getDb();
+analyticsRouter.get('/summary', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
 
-  // Savings are priced per request at the served model's paid-equivalent
-  // rate (models.paid_input_per_m / paid_output_per_m — see db/model-pricing.ts),
-  // with a modest fallback for custom/unmapped models, and only count
-  // successful requests. This is "what the same tokens would have cost on
-  // paid APIs", not a GPT-4o fantasy number.
-  const stats = db.prepare(`
-    SELECT
-      COUNT(*) as total_requests,
-      SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) as success_count,
-      SUM(r.input_tokens) as total_input_tokens,
-      SUM(r.output_tokens) as total_output_tokens,
-      AVG(r.latency_ms) as avg_latency_ms,
-      MIN(r.created_at) as first_request_at,
-      SUM(CASE WHEN r.requested_model IS NOT NULL THEN 1 ELSE 0 END) as pinned_count,
-      SUM(CASE WHEN r.requested_model = r.model_id THEN 1 ELSE 0 END) as pin_honored_count,
-      SUM(CASE WHEN r.status = 'success' THEN
-        r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
-        r.output_tokens * COALESCE(m.paid_output_per_m, ?) / 1000000.0
-      ELSE 0 END) as est_savings
-    FROM requests r
-    LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
-    WHERE r.created_at >= ?
-  `).get(FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M, since) as any;
+  try {
+    const range = (req.query.range as string) ?? '7d';
+    const since = getSinceTimestamp(range);
+    const requests = await getUserRequests(user.userId, 10000);
 
-  const totalRequests = stats.total_requests ?? 0;
-  const successRate = totalRequests > 0 ? (stats.success_count / totalRequests) * 100 : 0;
+    const filtered = requests.filter(r => new Date(r.created_at) >= since);
+    
+    const totalRequests = filtered.length;
+    const successCount = filtered.filter(r => r.status === 'success').length;
+    const successRate = totalRequests > 0 ? (successCount / totalRequests) * 100 : 0;
+    
+    const totalInputTokens = filtered.reduce((sum, r) => sum + (r.input_tokens || 0), 0);
+    const totalOutputTokens = filtered.reduce((sum, r) => sum + (r.output_tokens || 0), 0);
+    
+    const latencies = filtered.filter(r => r.latency_ms > 0).map(r => r.latency_ms);
+    const avgLatencyMs = latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 0;
+    
+    const pinnedCount = filtered.filter(r => r.requested_model !== null).length;
+    const pinHonoredCount = filtered.filter(r => r.requested_model === r.model_id).length;
+    
+    const firstRequestAt = filtered.length > 0 ? filtered[filtered.length - 1].created_at : null;
+    
+    const estSavings = filtered
+      .filter(r => r.status === 'success')
+      .reduce((sum, r) => {
+        return sum + (r.input_tokens * FALLBACK_INPUT_PER_M / 1000000) + (r.output_tokens * FALLBACK_OUTPUT_PER_M / 1000000);
+      }, 0);
 
-  res.json({
-    totalRequests,
-    successRate: Math.round(successRate * 10) / 10,
-    totalInputTokens: stats.total_input_tokens ?? 0,
-    totalOutputTokens: stats.total_output_tokens ?? 0,
-    avgLatencyMs: Math.round(stats.avg_latency_ms ?? 0),
-    estimatedCostSavings: Math.round((stats.est_savings ?? 0) * 100) / 100,
-    // Pinned = requests where the client named a specific model (not 'auto').
-    // Honored = the pinned model actually served it; the difference is
-    // failovers that overrode the pin.
-    pinnedRequests: stats.pinned_count ?? 0,
-    pinHonoredRequests: stats.pin_honored_count ?? 0,
-    // Lets the client project savings from the ACTUAL data span (a 2-day-old
-    // install shouldn't extrapolate as if the whole range had traffic).
-    firstRequestAt: stats.first_request_at ?? null,
-  });
+    res.json({
+      totalRequests,
+      successRate: Math.round(successRate * 10) / 10,
+      totalInputTokens,
+      totalOutputTokens,
+      avgLatencyMs: Math.round(avgLatencyMs),
+      estimatedCostSavings: Math.round(estSavings * 100) / 100,
+      pinnedRequests: pinnedCount,
+      pinHonoredRequests: pinHonoredCount,
+      firstRequestAt,
+    });
+  } catch (error) {
+    console.error('Error fetching analytics summary:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch analytics summary' } });
+  }
 });
 
-// Stats grouped by model
-analyticsRouter.get('/by-model', (req: Request, res: Response) => {
-  const range = (req.query.range as string) ?? '7d';
-  const since = getSinceTimestamp(range);
-  const db = getDb();
+analyticsRouter.get('/by-model', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
 
-  const rows = db.prepare(`
-    SELECT
-      r.platform,
-      r.model_id,
-      m.display_name,
-      COUNT(*) as requests,
-      SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as success_rate,
-      AVG(r.latency_ms) as avg_latency_ms,
-      SUM(r.input_tokens) as total_input_tokens,
-      SUM(r.output_tokens) as total_output_tokens,
-      SUM(CASE WHEN r.requested_model = r.model_id THEN 1 ELSE 0 END) as pinned_requests,
-      SUM(CASE WHEN r.status = 'success' THEN
-        r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
-        r.output_tokens * COALESCE(m.paid_output_per_m, ?) / 1000000.0
-      ELSE 0 END) as est_cost
-    FROM requests r
-    LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
-    WHERE r.created_at >= ?
-    GROUP BY r.platform, r.model_id
-    ORDER BY requests DESC
-  `).all(FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M, since) as any[];
+  try {
+    const range = (req.query.range as string) ?? '7d';
+    const since = getSinceTimestamp(range);
+    const requests = await getUserRequests(user.userId, 10000);
+    const filtered = requests.filter(r => new Date(r.created_at) >= since);
 
-  res.json(rows.map(r => ({
-    platform: r.platform,
-    modelId: r.model_id,
-    displayName: r.display_name ?? r.model_id,
-    requests: r.requests,
-    successRate: Math.round(r.success_rate * 10) / 10,
-    avgLatencyMs: Math.round(r.avg_latency_ms),
-    totalInputTokens: r.total_input_tokens ?? 0,
-    totalOutputTokens: r.total_output_tokens ?? 0,
-    // Requests this model served because the client pinned it by name.
-    pinnedRequests: r.pinned_requests ?? 0,
-    estimatedCost: Math.round((r.est_cost ?? 0) * 100) / 100,
-  })));
+    const byModel = new Map<string, any>();
+    
+    for (const r of filtered) {
+      const key = `${r.platform}:${r.model_id}`;
+      if (!byModel.has(key)) {
+        byModel.set(key, {
+          platform: r.platform,
+          model_id: r.model_id,
+          display_name: r.model_id,
+          requests: 0,
+          success_count: 0,
+          total_latency_ms: 0,
+          latency_count: 0,
+          total_input_tokens: 0,
+          total_output_tokens: 0,
+          pinned_requests: 0,
+          total_cost: 0,
+        });
+      }
+      const stats = byModel.get(key);
+      stats.requests++;
+      if (r.status === 'success') stats.success_count++;
+      if (r.latency_ms > 0) {
+        stats.total_latency_ms += r.latency_ms;
+        stats.latency_count++;
+      }
+      stats.total_input_tokens += r.input_tokens || 0;
+      stats.total_output_tokens += r.output_tokens || 0;
+      if (r.requested_model === r.model_id) stats.pinned_requests++;
+      if (r.status === 'success') {
+        stats.total_cost += (r.input_tokens * FALLBACK_INPUT_PER_M / 1000000) + (r.output_tokens * FALLBACK_OUTPUT_PER_M / 1000000);
+      }
+    }
+
+    const result = Array.from(byModel.values()).map(r => ({
+      platform: r.platform,
+      modelId: r.model_id,
+      displayName: r.display_name,
+      requests: r.requests,
+      successRate: r.requests > 0 ? Math.round((r.success_count / r.requests) * 1000) / 10 : 0,
+      avgLatencyMs: r.latency_count > 0 ? Math.round(r.total_latency_ms / r.latency_count) : 0,
+      totalInputTokens: r.total_input_tokens,
+      totalOutputTokens: r.total_output_tokens,
+      pinnedRequests: r.pinned_requests,
+      estimatedCost: Math.round(r.total_cost * 100) / 100,
+    })).sort((a, b) => b.requests - a.requests);
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching analytics by model:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch analytics by model' } });
+  }
 });
 
-// Stats grouped by platform
-analyticsRouter.get('/by-platform', (req: Request, res: Response) => {
-  const range = (req.query.range as string) ?? '7d';
-  const since = getSinceTimestamp(range);
-  const db = getDb();
+analyticsRouter.get('/by-platform', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
 
-  const rows = db.prepare(`
-    SELECT
-      platform,
-      COUNT(*) as requests,
-      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as success_rate,
-      AVG(latency_ms) as avg_latency_ms,
-      SUM(input_tokens) as total_input_tokens,
-      SUM(output_tokens) as total_output_tokens
-    FROM requests
-    WHERE created_at >= ?
-    GROUP BY platform
-    ORDER BY requests DESC
-  `).all(since) as any[];
+  try {
+    const range = (req.query.range as string) ?? '7d';
+    const since = getSinceTimestamp(range);
+    const requests = await getUserRequests(user.userId, 10000);
+    const filtered = requests.filter(r => new Date(r.created_at) >= since);
 
-  res.json(rows.map(r => ({
-    platform: r.platform,
-    requests: r.requests,
-    successRate: Math.round(r.success_rate * 10) / 10,
-    avgLatencyMs: Math.round(r.avg_latency_ms),
-    totalInputTokens: r.total_input_tokens ?? 0,
-    totalOutputTokens: r.total_output_tokens ?? 0,
-  })));
+    const byPlatform = new Map<string, any>();
+    
+    for (const r of filtered) {
+      if (!byPlatform.has(r.platform)) {
+        byPlatform.set(r.platform, {
+          platform: r.platform,
+          requests: 0,
+          success_count: 0,
+          total_latency_ms: 0,
+          latency_count: 0,
+          total_input_tokens: 0,
+          total_output_tokens: 0,
+        });
+      }
+      const stats = byPlatform.get(r.platform);
+      stats.requests++;
+      if (r.status === 'success') stats.success_count++;
+      if (r.latency_ms > 0) {
+        stats.total_latency_ms += r.latency_ms;
+        stats.latency_count++;
+      }
+      stats.total_input_tokens += r.input_tokens || 0;
+      stats.total_output_tokens += r.output_tokens || 0;
+    }
+
+    const result = Array.from(byPlatform.values()).map(r => ({
+      platform: r.platform,
+      requests: r.requests,
+      successRate: r.requests > 0 ? Math.round((r.success_count / r.requests) * 1000) / 10 : 0,
+      avgLatencyMs: r.latency_count > 0 ? Math.round(r.total_latency_ms / r.latency_count) : 0,
+      totalInputTokens: r.total_input_tokens,
+      totalOutputTokens: r.total_output_tokens,
+    })).sort((a, b) => b.requests - a.requests);
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching analytics by platform:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch analytics by platform' } });
+  }
 });
 
-// Timeline data
-analyticsRouter.get('/timeline', (req: Request, res: Response) => {
-  const range = (req.query.range as string) ?? '7d';
-  const interval = (req.query.interval as string) ?? (range === '24h' ? 'hour' : 'day');
-  const since = getSinceTimestamp(range);
-  const db = getDb();
+analyticsRouter.get('/timeline', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
 
-  // dateFormat is a hardcoded whitelist — never user-controlled.
-  const dateFormat = interval === 'hour' ? '%Y-%m-%dT%H:00:00' : '%Y-%m-%d';
+  try {
+    const range = (req.query.range as string) ?? '7d';
+    const interval = (req.query.interval as string) ?? (range === '24h' ? 'hour' : 'day');
+    const since = getSinceTimestamp(range);
+    const requests = await getUserRequests(user.userId, 10000);
+    const filtered = requests.filter(r => new Date(r.created_at) >= since);
 
-  const rows = db.prepare(`
-    SELECT
-      strftime('${dateFormat}', created_at) as timestamp,
-      COUNT(*) as requests,
-      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
-      SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as failure_count
-    FROM requests
-    WHERE created_at >= ?
-    GROUP BY strftime('${dateFormat}', created_at)
-    ORDER BY timestamp ASC
-  `).all(since) as any[];
+    const timeline = new Map<string, any>();
+    
+    for (const r of filtered) {
+      const date = new Date(r.created_at);
+      let key: string;
+      if (interval === 'hour') {
+        key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}T${String(date.getHours()).padStart(2, '0')}:00:00`;
+      } else {
+        key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+      }
+      
+      if (!timeline.has(key)) {
+        timeline.set(key, { timestamp: key, requests: 0, success_count: 0, failure_count: 0 });
+      }
+      const stats = timeline.get(key);
+      stats.requests++;
+      if (r.status === 'success') stats.success_count++;
+      else if (r.status === 'error') stats.failure_count++;
+    }
 
-  res.json(rows.map(r => ({
-    timestamp: r.timestamp,
-    requests: r.requests,
-    successCount: r.success_count,
-    failureCount: r.failure_count,
-  })));
+    const result = Array.from(timeline.values()).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching analytics timeline:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch analytics timeline' } });
+  }
 });
 
-// Error distribution (grouped by error type and platform)
-analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
-  const range = (req.query.range as string) ?? '7d';
-  const since = getSinceTimestamp(range);
-  const db = getDb();
+analyticsRouter.get('/error-distribution', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
 
-  // Group errors by category (extract the key part of the error message)
-  const rows = db.prepare(`
-    SELECT
-      platform,
-      model_id,
-      CASE
-        WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
-        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid.*key%' THEN 'Auth Error (401)'
-        WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
-        WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
-        WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
-        WHEN error LIKE '%500%' OR error LIKE '%internal server%' THEN 'Server Error (500)'
-        WHEN error LIKE '%503%' OR error LIKE '%unavailable%' THEN 'Unavailable (503)'
-        ELSE 'Other'
-      END as error_category,
-      COUNT(*) as count
-    FROM requests
-    WHERE status = 'error' AND created_at >= ?
-    GROUP BY platform, error_category
-    ORDER BY count DESC
-  `).all(since) as any[];
+  try {
+    const range = (req.query.range as string) ?? '7d';
+    const since = getSinceTimestamp(range);
+    const requests = await getUserRequests(user.userId, 10000);
+    const filtered = requests.filter(r => new Date(r.created_at) >= since && r.status === 'error');
 
-  // Also get totals by category
-  const byCategory = db.prepare(`
-    SELECT
-      CASE
-        WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
-        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid.*key%' THEN 'Auth Error (401)'
-        WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
-        WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
-        WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
-        WHEN error LIKE '%500%' OR error LIKE '%internal server%' THEN 'Server Error (500)'
-        WHEN error LIKE '%503%' OR error LIKE '%unavailable%' THEN 'Unavailable (503)'
-        ELSE 'Other'
-      END as category,
-      COUNT(*) as count
-    FROM requests
-    WHERE status = 'error' AND created_at >= ?
-    GROUP BY category
-    ORDER BY count DESC
-  `).all(since) as any[];
+    const byCategory = new Map<string, number>();
+    const byPlatform = new Map<string, number>();
+    const detailed = new Map<string, any>();
 
-  // Errors by platform
-  const byPlatform = db.prepare(`
-    SELECT platform, COUNT(*) as count
-    FROM requests
-    WHERE status = 'error' AND created_at >= ?
-    GROUP BY platform
-    ORDER BY count DESC
-  `).all(since) as any[];
+    function categorizeError(error: string | null): string {
+      if (!error) return 'Other';
+      const e = error.toLowerCase();
+      if (e.includes('429') || e.includes('rate limit') || e.includes('too many') || e.includes('quota')) return 'Rate Limited (429)';
+      if (e.includes('401') || e.includes('unauthorized') || e.includes('invalid')) return 'Auth Error (401)';
+      if (e.includes('403') || e.includes('forbidden')) return 'Forbidden (403)';
+      if (e.includes('404') || e.includes('not found')) return 'Not Found (404)';
+      if (e.includes('timeout') || e.includes('etimedout') || e.includes('econnrefused')) return 'Timeout/Connection';
+      if (e.includes('500') || e.includes('internal server')) return 'Server Error (500)';
+      if (e.includes('503') || e.includes('unavailable')) return 'Unavailable (503)';
+      return 'Other';
+    }
 
-  res.json({
-    byCategory,
-    byPlatform,
-    detailed: rows,
-  });
+    for (const r of filtered) {
+      const category = categorizeError(r.error);
+      byCategory.set(category, (byCategory.get(category) || 0) + 1);
+      byPlatform.set(r.platform, (byPlatform.get(r.platform) || 0) + 1);
+      
+      const key = `${r.platform}:${r.model_id}:${category}`;
+      if (!detailed.has(key)) {
+        detailed.set(key, { platform: r.platform, model_id: r.model_id, error_category: category, count: 0 });
+      }
+      detailed.get(key).count++;
+    }
+
+    res.json({
+      byCategory: Array.from(byCategory.entries()).map(([category, count]) => ({ category, count })).sort((a, b) => b.count - a.count),
+      byPlatform: Array.from(byPlatform.entries()).map(([platform, count]) => ({ platform, count })).sort((a, b) => b.count - a.count),
+      detailed: Array.from(detailed.values()).sort((a, b) => b.count - a.count),
+    });
+  } catch (error) {
+    console.error('Error fetching error distribution:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch error distribution' } });
+  }
 });
 
-// Recent errors
-analyticsRouter.get('/errors', (req: Request, res: Response) => {
-  const range = (req.query.range as string) ?? '7d';
-  const since = getSinceTimestamp(range);
-  const db = getDb();
+analyticsRouter.get('/errors', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
 
-  const rows = db.prepare(`
-    SELECT id, platform, model_id, error, latency_ms, created_at
-    FROM requests
-    WHERE status = 'error' AND created_at >= ?
-    ORDER BY created_at DESC
-    LIMIT 50
-  `).all(since) as any[];
+  try {
+    const range = (req.query.range as string) ?? '7d';
+    const since = getSinceTimestamp(range);
+    const requests = await getUserRequests(user.userId, 10000);
+    const filtered = requests.filter(r => new Date(r.created_at) >= since && r.status === 'error');
 
-  res.json(rows.map(r => ({
-    id: r.id,
-    platform: r.platform,
-    modelId: r.model_id,
-    error: r.error,
-    latencyMs: r.latency_ms,
-    createdAt: r.created_at,
-  })));
+    const result = filtered.slice(0, 50).map(r => ({
+      id: r.id,
+      platform: r.platform,
+      modelId: r.model_id,
+      error: r.error,
+      latencyMs: r.latency_ms,
+      createdAt: r.created_at,
+    }));
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching errors:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch errors' } });
+  }
 });

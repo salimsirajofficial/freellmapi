@@ -2,16 +2,12 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import {
-  userCount,
+  signUp,
+  signIn,
+  signOut,
+  getUser,
   hasNonDesktopUser,
-  createUser,
-  verifyCredentials,
-  createSession,
-  validateSession,
-  deleteSession,
-} from '../services/auth.js';
-import { getDb } from '../db/index.js';
-import { backupDbToPostgres } from '../db/postgres-sync.js';
+} from '../services/auth-supabase.js';
 
 export const authRouter = Router();
 
@@ -24,114 +20,87 @@ const credentialsSchema = z.object({
   password: z.string().min(8, 'Password must be at least 8 characters'),
 });
 
-// ── Brute-force throttle ──────────────────────────────────────────────────
-// Simple in-memory per-email limiter. A local single-user tool doesn't need a
-// distributed store; this just blunts online password guessing.
-const MAX_ATTEMPTS = 5;
-const LOCKOUT_MS = 15 * 60 * 1000;
-const attempts = new Map<string, { count: number; lockedUntil: number }>();
-
-function isLockedOut(email: string): boolean {
-  const a = attempts.get(email.toLowerCase());
-  return !!a && a.lockedUntil > Date.now();
-}
-function recordFailure(email: string): void {
-  const key = email.toLowerCase();
-  const a = attempts.get(key) ?? { count: 0, lockedUntil: 0 };
-  a.count++;
-  if (a.count >= MAX_ATTEMPTS) {
-    a.lockedUntil = Date.now() + LOCKOUT_MS;
-    a.count = 0;
-  }
-  attempts.set(key, a);
-}
-function clearFailures(email: string): void {
-  attempts.delete(email.toLowerCase());
-}
-
 function bearer(req: Request): string | undefined {
   return req.headers.authorization?.replace(/^Bearer\s+/i, '')
     ?? (req.headers['x-dashboard-token'] as string | undefined);
 }
 
 // Has the dashboard been set up yet, and is this caller authenticated?
-authRouter.get('/status', (req: Request, res: Response) => {
-  const session = validateSession(bearer(req));
+authRouter.get('/status', async (req: Request, res: Response) => {
+  const token = bearer(req);
+  const user = token ? await getUser(token) : null;
+  const needsSetup = !(await hasNonDesktopUser());
   res.json({
-    needsSetup: !hasNonDesktopUser(),
-    authenticated: !!session,
-    email: session?.email ?? null,
+    needsSetup,
+    authenticated: !!user,
+    email: user?.email ?? null,
   });
 });
 
 // First-run account creation. Only allowed while there are zero users, so it
 // can't be used to add accounts once the dashboard is claimed.
 authRouter.post('/setup', async (req: Request, res: Response) => {
-  console.log('[AUTH-ROUTE] /setup called');
-  if (hasNonDesktopUser()) {
-    console.log('[AUTH-ROUTE] /setup rejected: setup already completed');
+  if (await hasNonDesktopUser()) {
     res.status(409).json({ error: { message: 'Setup already completed. Use login instead.', type: 'setup_complete' } });
     return;
   }
   const parsed = credentialsSchema.safeParse(req.body);
   if (!parsed.success) {
-    console.log('[AUTH-ROUTE] /setup validation failed:', parsed.error.errors.map(e => e.message).join(', '));
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
-  console.log('[AUTH-ROUTE] /setup creating user with email:', parsed.data.email);
-  const user = createUser(parsed.data.email, parsed.data.password);
-  clearFailures(user.email);
-  const token = createSession(user.userId);
-  await backupDbToPostgres(getDb(), 'auth setup').catch((err: any) => {
-    console.error('[postgres-sync] Immediate backup after auth setup failed:', err?.message || err);
-  });
-  console.log('[AUTH-ROUTE] /setup successful for email:', user.email);
-  res.status(201).json({ token, email: user.email });
+  try {
+    const result = await signUp(parsed.data.email, parsed.data.password);
+    console.log(`[auth] Signup succeeded for ${result.user.email} (userId=${result.user.userId})`);
+    res.status(201).json({ token: result.session, email: result.user.email });
+  } catch (err: any) {
+    console.error(`[auth] Signup failed for ${parsed.data.email}:`, err.message || err);
+    res.status(400).json({ error: { message: err.message || 'Signup failed' } });
+  }
 });
 
-authRouter.post('/login', (req: Request, res: Response) => {
-  console.log('[AUTH-ROUTE] /login called');
+authRouter.post('/login', async (req: Request, res: Response) => {
   const parsed = credentialsSchema.safeParse(req.body);
   if (!parsed.success) {
-    console.log('[AUTH-ROUTE] /login validation failed:', parsed.error.errors.map(e => e.message).join(', '));
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
   const { email, password } = parsed.data;
-  console.log('[AUTH-ROUTE] /login attempting with email:', email);
 
-  if (isLockedOut(email)) {
-    console.log('[AUTH-ROUTE] /login rejected: rate limit exceeded for email:', email);
-    res.status(429).json({ error: { message: 'Too many failed attempts. Try again later.', type: 'rate_limit_error' } });
-    return;
+  try {
+    const result = await signIn(email, password);
+    console.log(`[auth] Login succeeded for ${result.user.email}`);
+    res.json({ token: result.session, email: result.user.email });
+  } catch (err: any) {
+    console.warn(`[auth] Login failed for ${email}:`, err.message || err);
+    res.status(401).json({
+      error: { message: err?.message || 'Invalid email or password', type: 'authentication_error' },
+    });
   }
-
-  const user = verifyCredentials(email, password);
-  if (!user) {
-    console.log('[AUTH-ROUTE] /login failed: invalid credentials for email:', email);
-    recordFailure(email);
-    // Same message whether the email exists or not — don't leak which.
-    res.status(401).json({ error: { message: 'Invalid email or password', type: 'authentication_error' } });
-    return;
-  }
-
-  clearFailures(email);
-  const token = createSession(user.userId);
-  console.log('[AUTH-ROUTE] /login successful for email:', user.email);
-  res.json({ token, email: user.email });
 });
 
-authRouter.post('/logout', (req: Request, res: Response) => {
-  deleteSession(bearer(req));
+authRouter.post('/logout', async (req: Request, res: Response) => {
+  const token = bearer(req);
+  if (token) {
+    try {
+      await signOut(token);
+    } catch (err) {
+      // Ignore logout errors
+    }
+  }
   res.json({ success: true });
 });
 
-authRouter.get('/me', (req: Request, res: Response) => {
-  const session = validateSession(bearer(req));
-  if (!session) {
+authRouter.get('/me', async (req: Request, res: Response) => {
+  const token = bearer(req);
+  if (!token) {
     res.status(401).json({ error: { message: 'Authentication required', type: 'authentication_error' } });
     return;
   }
-  res.json({ email: session.email });
+  const user = await getUser(token);
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required', type: 'authentication_error' } });
+    return;
+  }
+  res.json({ email: user.email });
 });

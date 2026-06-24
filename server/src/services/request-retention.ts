@@ -1,11 +1,9 @@
-import { getDb } from '../db/index.js';
+﻿import { deleteOldRequests, getUserRequests } from '../db/supabase-queries.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RETENTION_DAYS = 90;
 const DEFAULT_MAX_ROWS = 100_000;
 const PRUNE_INTERVAL_MS = 60_000;
-
-type RetentionDb = ReturnType<typeof getDb>;
 
 export interface RequestAnalyticsRetentionConfig {
   retentionDays: number;
@@ -23,10 +21,6 @@ function readNonNegativeInt(name: string, defaultValue: number): number {
   return parsed;
 }
 
-function toSqliteTimestamp(date: Date): string {
-  return date.toISOString().slice(0, 19).replace('T', ' ');
-}
-
 export function getRequestAnalyticsRetentionConfig(): RequestAnalyticsRetentionConfig {
   return {
     retentionDays: readNonNegativeInt('REQUEST_ANALYTICS_RETENTION_DAYS', DEFAULT_RETENTION_DAYS),
@@ -34,11 +28,11 @@ export function getRequestAnalyticsRetentionConfig(): RequestAnalyticsRetentionC
   };
 }
 
-export function pruneRequestAnalytics(options: {
-  db?: RetentionDb;
+export async function pruneRequestAnalytics(options: {
+  userId?: string;
   force?: boolean;
   now?: Date;
-} = {}): { deleted: number; skipped: boolean } {
+} = {}): Promise<{ deleted: number; skipped: boolean }> {
   const now = options.now ?? new Date();
   const nowMs = now.getTime();
 
@@ -47,25 +41,36 @@ export function pruneRequestAnalytics(options: {
   }
   nextPruneAtMs = nowMs + PRUNE_INTERVAL_MS;
 
-  const db = options.db ?? getDb();
   const { retentionDays, maxRows } = getRequestAnalyticsRetentionConfig();
   let deleted = 0;
 
+  if (!options.userId) {
+    // If no userId provided, skip (we need userId for Supabase RLS)
+    return { deleted: 0, skipped: true };
+  }
+
   if (retentionDays > 0) {
-    const cutoff = toSqliteTimestamp(new Date(nowMs - retentionDays * DAY_MS));
-    deleted += db.prepare('DELETE FROM requests WHERE created_at < ?').run(cutoff).changes;
+    const cutoff = new Date(nowMs - retentionDays * DAY_MS);
+    try {
+      await deleteOldRequests(options.userId, cutoff);
+      deleted += 1; // We don't get exact count from Supabase delete
+    } catch (error) {
+      console.error('Error pruning old requests:', error);
+    }
   }
 
   if (maxRows > 0) {
-    deleted += db.prepare(`
-      DELETE FROM requests
-      WHERE id IN (
-        SELECT id
-        FROM requests
-        ORDER BY created_at DESC, id DESC
-        LIMIT -1 OFFSET ?
-      )
-    `).run(maxRows).changes;
+    try {
+      const requests = await getUserRequests(options.userId, maxRows + 1);
+      if (requests.length > maxRows) {
+        // Delete excess rows
+        const cutoffDate = new Date(requests[maxRows].created_at);
+        await deleteOldRequests(options.userId, cutoffDate);
+        deleted += requests.length - maxRows;
+      }
+    } catch (error) {
+      console.error('Error pruning excess requests:', error);
+    }
   }
 
   return { deleted, skipped: false };

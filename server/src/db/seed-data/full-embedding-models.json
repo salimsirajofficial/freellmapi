@@ -1,0 +1,134 @@
+[
+  {
+    "family": "gemini-embedding-001",
+    "platform": "google",
+    "model_id": "gemini-embedding-001",
+    "display_name": "Gemini Embedding",
+    "dimensions": 3072,
+    "max_input_tokens": 2048,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "100 rpm · 1K req/day"
+  },
+  {
+    "family": "llama-nemotron-embed-vl-1b-v2",
+    "platform": "nvidia",
+    "model_id": "nvidia/llama-nemotron-embed-vl-1b-v2",
+    "display_name": "Nemotron Embed VL 1B",
+    "dimensions": 2048,
+    "max_input_tokens": 8192,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "~40 rpm"
+  },
+  {
+    "family": "llama-nemotron-embed-vl-1b-v2",
+    "platform": "openrouter",
+    "model_id": "nvidia/llama-nemotron-embed-vl-1b-v2",
+    "display_name": "Nemotron Embed VL 1B (OR)",
+    "dimensions": 2048,
+    "max_input_tokens": 8192,
+    "priority": 2,
+    "enabled": 1,
+    "quota_label": "$0/M tok"
+  },
+  {
+    "family": "llama-nemotron-embed-1b-v2",
+    "platform": "nvidia",
+    "model_id": "nvidia/llama-nemotron-embed-1b-v2",
+    "display_name": "Nemotron Embed 1B",
+    "dimensions": 2048,
+    "max_input_tokens": 8192,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "~40 rpm"
+  },
+  {
+    "family": "nv-embedqa-e5-v5",
+    "platform": "nvidia",
+    "model_id": "nvidia/nv-embedqa-e5-v5",
+    "display_name": "NV-EmbedQA E5 v5",
+    "dimensions": 1024,
+    "max_input_tokens": 512,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "~40 rpm"
+  },
+  {
+    "family": "text-embedding-3-small",
+    "platform": "github",
+    "model_id": "openai/text-embedding-3-small",
+    "display_name": "Text Embedding 3 Small",
+    "dimensions": 1536,
+    "max_input_tokens": 8191,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "rate-limited free"
+  },
+  {
+    "family": "text-embedding-3-large",
+    "platform": "github",
+    "model_id": "openai/text-embedding-3-large",
+    "display_name": "Text Embedding 3 Large",
+    "dimensions": 3072,
+    "max_input_tokens": 8191,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "rate-limited free"
+  },
+  {
+    "family": "bge-m3",
+    "platform": "cloudflare",
+    "model_id": "@cf/baai/bge-m3",
+    "display_name": "BGE-M3",
+    "dimensions": 1024,
+    "max_input_tokens": 8192,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "10K neurons/day (shared)"
+  },
+  {
+    "family": "bge-m3",
+    "platform": "huggingface",
+    "model_id": "BAAI/bge-m3",
+    "display_name": "BGE-M3 (HF)",
+    "dimensions": 1024,
+    "max_input_tokens": 8192,
+    "priority": 2,
+    "enabled": 1,
+    "quota_label": "$0.10/mo credits"
+  },
+  {
+    "family": "embeddinggemma-300m",
+    "platform": "cloudflare",
+    "model_id": "@cf/google/embeddinggemma-300m",
+    "display_name": "EmbeddingGemma 300M",
+    "dimensions": 768,
+    "max_input_tokens": 2048,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "10K neurons/day (shared)"
+  },
+  {
+    "family": "qwen3-embedding-0.6b",
+    "platform": "cloudflare",
+    "model_id": "@cf/qwen/qwen3-embedding-0.6b",
+    "display_name": "Qwen3 Embedding 0.6B",
+    "dimensions": 1024,
+    "max_input_tokens": 4096,
+    "priority": 1,
+    "enabled": 1,
+    "quota_label": "10K neurons/day (shared)"
+  },
+  {
+    "family": "embed-v4.0",
+    "platform": "cohere",
+    "model_id": "embed-v4.0",
+    "display_name": "Cohere Embed v4",
+    "dimensions": 1536,
+    "max_input_tokens": 128000,
+    "priority": 1,
+    "enabled": 0,
+    "quota_label": "1K calls/mo (shared w/ chat)"
+  }
+]

@@ -10,13 +10,12 @@ import type {
 } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
-import { getUnifiedApiKey } from '../db/index.js';
+import { findUserIdByUnifiedApiKey } from '../db/supabase-queries.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import {
   isRetryableError,
   isPaymentRequiredError,
-  timingSafeStringEqual,
   extractApiToken,
   getStickyModel,
   setStickyModel,
@@ -263,8 +262,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   // Same unified-key auth as the proxy (accepts Bearer or x-api-key).
   const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  const userId = token ? await findUserIdByUnifiedApiKey(token) : null;
+  if (!userId) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
@@ -323,7 +322,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // that serializes the call into text strands the agent harness with a
   // "successful" run it can't act on. Mirrors the /chat/completions gate.
   const wantsTools = (tools?.length ?? 0) > 0;
-  if (wantsTools && !hasEnabledToolsModel()) {
+  if (wantsTools && !(await hasEnabledToolsModel(userId))) {
     res.status(422).json({
       error: {
         message: 'This request includes tools, but no tool-capable model is enabled. Enable a tool-calling model (e.g. GPT-OSS 120B, Gemini 3.5 Flash, GLM-4.7) in the Fallback Chain.',
@@ -349,7 +348,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools);
+      route = await routeRequest(userId, estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools);
     } catch (err: any) {
       const status = lastError ? 429 : (err.status ?? 503);
       const message = lastError
@@ -365,7 +364,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       return;
     }
 
-    recordRequest(route.platform, route.modelId, route.keyId);
+    await recordRequest(userId, route.platform, route.modelId, route.keyId);
 
     try {
       if (stream) {
@@ -468,9 +467,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // skeletons are out), so it's safe to fail over to the next model on
         // the same SSE stream.
         if (msgText.length === 0 && toolAcc.size === 0) {
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
+          await logRequest(userId, route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          await setCooldown(userId, route.platform, route.modelId, route.keyId, await getCooldownDurationForLimit(userId, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
@@ -503,10 +502,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         sse('response.completed', { response: finalResponse });
         res.end();
 
-        recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
+        await recordTokens(userId, route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId);
-        logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
+        await logRequest(userId, route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
         return;
       } else {
         const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, completionOpts);
@@ -522,15 +521,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         // Empty completion → fail over (see the streaming-path comment above).
         if (!text && toolCalls.length === 0) {
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
+          await logRequest(userId, route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          await setCooldown(userId, route.platform, route.modelId, route.keyId, await getCooldownDurationForLimit(userId, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
         }
 
-        recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? 0);
+        await recordTokens(userId, route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? 0);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId);
 
@@ -541,13 +540,13 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           promptTokens, completionTokens,
         }));
 
-        logRequest(route.platform, route.modelId, route.keyId, 'success',
+        await logRequest(userId, route.platform, route.modelId, route.keyId, 'success',
           promptTokens, completionTokens, Date.now() - start, null);
         return;
       }
     } catch (err: any) {
       const latency = Date.now() - start;
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, err.message);
+      await logRequest(userId, route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, err.message);
 
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
       if (stream && streamStarted) {
@@ -558,9 +557,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
       if (isRetryableError(err)) {
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(route.platform, route.modelId, route.keyId, isPaymentRequiredError(err)
+        await setCooldown(userId, route.platform, route.modelId, route.keyId, isPaymentRequiredError(err)
           ? PAYMENT_REQUIRED_COOLDOWN_MS
-          : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          : await getCooldownDurationForLimit(userId, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
         recordRateLimitHit(route.modelDbId);
         lastError = err;
         continue;

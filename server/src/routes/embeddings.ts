@@ -1,113 +1,146 @@
-import { Router } from 'express';
+﻿import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { getDb, setSetting } from '../db/index.js';
-import { backupDbToPostgres } from '../db/postgres-sync.js';
+import { getUserApiKeys, getUserRequests, setUserSetting, updateEmbeddingModel } from '../db/supabase-queries.js';
 import { listEmbeddingModels, getDefaultFamily, type EmbeddingModelRow } from '../services/embeddings.js';
 
 export const embeddingsRouter = Router();
 
-// Families with their provider chains, for the dashboard Embeddings tab.
-embeddingsRouter.get('/', (_req: Request, res: Response) => {
-  const db = getDb();
-  const keyCounts = new Map(
-    (db.prepare(
-      "SELECT platform, COUNT(*) AS n FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform",
-    ).all() as { platform: string; n: number }[]).map(r => [r.platform, r.n]),
-  );
-
-  const byFamily = new Map<string, EmbeddingModelRow[]>();
-  for (const row of listEmbeddingModels()) {
-    const list = byFamily.get(row.family) ?? [];
-    list.push(row);
-    byFamily.set(row.family, list);
+embeddingsRouter.get('/', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
   }
 
-  const defaultFamily = getDefaultFamily();
-  res.json({
-    defaultFamily,
-    families: [...byFamily.entries()].map(([family, rows]) => ({
-      family,
-      dimensions: rows[0].dimensions,
-      maxInputTokens: rows[0].max_input_tokens,
-      isDefault: family === defaultFamily,
-      providers: rows.map(r => ({
-        id: r.id,
-        platform: r.platform,
-        modelId: r.model_id,
-        displayName: r.display_name,
-        priority: r.priority,
-        enabled: r.enabled === 1,
-        quotaLabel: r.quota_label,
-        keyCount: keyCounts.get(r.platform) ?? 0,
+  try {
+    const keys = await getUserApiKeys(user.userId);
+    const keyCounts = new Map<string, number>();
+    for (const key of keys) {
+      if (key.enabled === 1 && (key.status === 'healthy' || key.status === 'unknown')) {
+        keyCounts.set(key.platform, (keyCounts.get(key.platform) || 0) + 1);
+      }
+    }
+
+    const byFamily = new Map<string, EmbeddingModelRow[]>();
+    for (const row of await listEmbeddingModels()) {
+      const list = byFamily.get(row.family) ?? [];
+      list.push(row);
+      byFamily.set(row.family, list);
+    }
+
+    const defaultFamily = await getDefaultFamily(user.userId);
+    res.json({
+      defaultFamily,
+      families: [...byFamily.entries()].map(([family, rows]) => ({
+        family,
+        dimensions: rows[0].dimensions,
+        maxInputTokens: rows[0].max_input_tokens,
+        isDefault: family === defaultFamily,
+        providers: rows.map(r => ({
+          id: r.id,
+          platform: r.platform,
+          modelId: r.model_id,
+          displayName: r.display_name,
+          priority: r.priority,
+          enabled: r.enabled === 1,
+          quotaLabel: r.quota_label,
+          keyCount: keyCounts.get(r.platform) ?? 0,
+        })),
       })),
-    })),
-  });
+    });
+  } catch (error) {
+    console.error('Error fetching embeddings:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch embeddings' } });
+  }
 });
 
 const updateSchema = z.object({
   defaultFamily: z.string().optional(),
   providers: z.array(z.object({
-    id: z.number(),
+    id: z.string(),
     priority: z.number(),
     enabled: z.boolean(),
   })).optional(),
 });
 
 embeddingsRouter.put('/', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
+
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: 'Invalid request body' } });
     return;
   }
-  const db = getDb();
 
-  if (parsed.data.defaultFamily) {
-    const exists = db.prepare('SELECT 1 FROM embedding_models WHERE family = ?').get(parsed.data.defaultFamily);
-    if (!exists) {
-      res.status(400).json({ error: { message: `Unknown family '${parsed.data.defaultFamily}'` } });
-      return;
+  try {
+    if (parsed.data.defaultFamily) {
+      const families = new Set((await listEmbeddingModels()).map(r => r.family));
+      if (!families.has(parsed.data.defaultFamily)) {
+        res.status(400).json({ error: { message: `Unknown family '${parsed.data.defaultFamily}'` } });
+        return;
+      }
+      await setUserSetting(user.userId, 'embeddings_default_family', parsed.data.defaultFamily);
     }
-    setSetting('embeddings_default_family', parsed.data.defaultFamily);
-  }
 
-  if (parsed.data.providers) {
-    const update = db.prepare('UPDATE embedding_models SET priority = ?, enabled = ? WHERE id = ?');
-    const apply = db.transaction((rows: { id: number; priority: number; enabled: boolean }[]) => {
-      for (const r of rows) update.run(r.priority, r.enabled ? 1 : 0, r.id);
-    });
-    apply(parsed.data.providers);
-  }
+    if (parsed.data.providers) {
+      for (const p of parsed.data.providers) {
+        await updateEmbeddingModel(p.id, { priority: p.priority, enabled: p.enabled ? 1 : 0 });
+      }
+    }
 
-  await backupDbToPostgres(db, 'embeddings settings update').catch((err: any) => {
-    console.error('[postgres-sync] Immediate backup after embeddings settings update failed:', err?.message || err);
-  });
-  res.json({ success: true });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error updating embeddings settings:', error);
+    res.status(500).json({ error: { message: 'Failed to update embeddings settings' } });
+  }
 });
 
-// Per-family usage: requests today (most embedding quotas are daily/RPM) and
-// tokens this calendar month, from the tagged request log.
-embeddingsRouter.get('/usage', (_req: Request, res: Response) => {
-  const db = getDb();
-  const usage = db.prepare(`
-    SELECT em.family,
-           COALESCE(SUM(CASE WHEN r.created_at >= datetime('now', 'start of day') THEN 1 ELSE 0 END), 0) AS requests_today,
-           COALESCE(SUM(CASE WHEN r.created_at >= datetime('now', 'start of month') THEN r.input_tokens ELSE 0 END), 0) AS tokens_month
-    FROM embedding_models em
-    LEFT JOIN requests r
-      ON r.request_type = 'embedding'
-     AND r.status = 'success'
-     AND r.platform = em.platform
-     AND r.model_id = em.model_id
-     AND r.created_at >= datetime('now', 'start of month')
-    GROUP BY em.family
-  `).all() as { family: string; requests_today: number; tokens_month: number }[];
+embeddingsRouter.get('/usage', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
 
-  res.json({
-    families: usage.map(u => ({
-      family: u.family,
-      requestsToday: u.requests_today,
-      tokensMonth: u.tokens_month,
-    })),
-  });
+  try {
+    const requests = await getUserRequests(user.userId, 100000);
+    const now = new Date();
+    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const embeddingModels = await listEmbeddingModels();
+    const byFamily = new Map<string, { requests_today: number; tokens_month: number }>();
+
+    for (const model of embeddingModels) {
+      byFamily.set(model.family, { requests_today: 0, tokens_month: 0 });
+    }
+
+    for (const r of requests) {
+      const requestDate = new Date(r.created_at);
+      const model = embeddingModels.find(m => m.platform === r.platform && m.model_id === r.model_id);
+      if (model && r.status === 'success') {
+        const stats = byFamily.get(model.family);
+        if (stats) {
+          if (requestDate >= startOfDay) stats.requests_today++;
+          if (requestDate >= startOfMonth) stats.tokens_month += r.input_tokens || 0;
+        }
+      }
+    }
+
+    res.json({
+      families: Array.from(byFamily.entries()).map(([family, stats]) => ({
+        family,
+        requestsToday: stats.requests_today,
+        tokensMonth: stats.tokens_month,
+      })),
+    });
+  } catch (error) {
+    console.error('Error fetching embeddings usage:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch embeddings usage' } });
+  }
 });

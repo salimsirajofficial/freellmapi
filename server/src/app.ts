@@ -61,13 +61,13 @@ export function createApp() {
   app.use('/api/auth', authRouter);
 
   // API routes — all admin endpoints sit behind requireAuth.
-  app.use('/api/keys', requireAuth, keysRouter);
-  app.use('/api/models', requireAuth, modelsRouter);
-  app.use('/api/fallback', requireAuth, fallbackRouter);
-  app.use('/api/embeddings', requireAuth, embeddingsRouter);
-  app.use('/api/analytics', requireAuth, analyticsRouter);
-  app.use('/api/health', requireAuth, healthRouter);
-  app.use('/api/settings', requireAuth, settingsRouter);
+  app.use('/api/keys', async (req, res, next) => requireAuth(req, res, next), keysRouter);
+  app.use('/api/models', async (req, res, next) => requireAuth(req, res, next), modelsRouter);
+  app.use('/api/fallback', async (req, res, next) => requireAuth(req, res, next), fallbackRouter);
+  app.use('/api/embeddings', async (req, res, next) => requireAuth(req, res, next), embeddingsRouter);
+  app.use('/api/analytics', async (req, res, next) => requireAuth(req, res, next), analyticsRouter);
+  app.use('/api/health', async (req, res, next) => requireAuth(req, res, next), healthRouter);
+  app.use('/api/settings', async (req, res, next) => requireAuth(req, res, next), settingsRouter);
 
   // OpenAI-compatible proxy. Per-IP rate limiting (#35 item #6) runs first so
   // it throttles unauthenticated brute-force / flood attempts before any

@@ -12,22 +12,17 @@
   },
   "dependencies": {
     "@freellmapi/shared": "*",
-    "better-sqlite3": "^12.10.0",
+    "@supabase/supabase-js": "^2.108.2",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
-    "drizzle-orm": "^0.44.2",
     "express": "^5.1.0",
     "helmet": "^8.1.0",
-    "pg": "^8.11.5",
     "zod": "^3.24.4"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.2",
     "@types/node": "^22.15.3",
-    "@types/pg": "^8.11.6",
-    "drizzle-kit": "^0.31.1",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3",
     "vitest": "^3.1.3"

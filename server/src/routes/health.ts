@@ -1,48 +1,70 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getDb } from '../db/index.js';
+import { getUserApiKeys, updateApiKey } from '../db/supabase-queries.js';
 import { checkKeyHealth, checkAllKeys } from '../services/health.js';
 import { hasProvider } from '../providers/index.js';
+import type { Platform } from '@freellmapi/shared/types.js';
 
 export const healthRouter = Router();
 
-// Get health status for all platforms
-healthRouter.get('/', (_req: Request, res: Response) => {
-  const db = getDb();
+// Get health status for all platforms (user-specific)
+healthRouter.get('/', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
 
-  const platforms = db.prepare(`
-    SELECT
+  try {
+    const keys = await getUserApiKeys(user.userId);
+    
+    // Group by platform and calculate stats
+    const platformStats = new Map<string, {
+      total_keys: number;
+      healthy_keys: number;
+      rate_limited_keys: number;
+      invalid_keys: number;
+      error_keys: number;
+      unknown_keys: number;
+      enabled_keys: number;
+    }>();
+
+    for (const key of keys) {
+      const stats = platformStats.get(key.platform) || {
+        total_keys: 0,
+        healthy_keys: 0,
+        rate_limited_keys: 0,
+        invalid_keys: 0,
+        error_keys: 0,
+        unknown_keys: 0,
+        enabled_keys: 0,
+      };
+      
+      stats.total_keys++;
+      if (key.status === 'healthy') stats.healthy_keys++;
+      else if (key.status === 'rate_limited') stats.rate_limited_keys++;
+      else if (key.status === 'invalid') stats.invalid_keys++;
+      else if (key.status === 'error') stats.error_keys++;
+      else stats.unknown_keys++;
+      
+      if (key.enabled === 1) stats.enabled_keys++;
+      
+      platformStats.set(key.platform, stats);
+    }
+
+    const platforms = Array.from(platformStats.entries()).map(([platform, stats]) => ({
       platform,
-      COUNT(*) as total_keys,
-      SUM(CASE WHEN status = 'healthy' THEN 1 ELSE 0 END) as healthy_keys,
-      SUM(CASE WHEN status = 'rate_limited' THEN 1 ELSE 0 END) as rate_limited_keys,
-      SUM(CASE WHEN status = 'invalid' THEN 1 ELSE 0 END) as invalid_keys,
-      SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_keys,
-      SUM(CASE WHEN status = 'unknown' THEN 1 ELSE 0 END) as unknown_keys,
-      SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) as enabled_keys
-    FROM api_keys
-    GROUP BY platform
-  `).all() as any[];
+      hasProvider: hasProvider(platform as Platform),
+      totalKeys: stats.total_keys,
+      healthyKeys: stats.healthy_keys,
+      rateLimitedKeys: stats.rate_limited_keys,
+      invalidKeys: stats.invalid_keys,
+      errorKeys: stats.error_keys,
+      unknownKeys: stats.unknown_keys,
+      enabledKeys: stats.enabled_keys,
+    }));
 
-  const keys = db.prepare(`
-    SELECT id, platform, label, status, enabled, created_at, last_checked_at
-    FROM api_keys
-    ORDER BY platform, created_at DESC
-  `).all() as any[];
-
-  res.json({
-    platforms: platforms.map(p => ({
-      platform: p.platform,
-      hasProvider: hasProvider(p.platform),
-      totalKeys: p.total_keys,
-      healthyKeys: p.healthy_keys,
-      rateLimitedKeys: p.rate_limited_keys,
-      invalidKeys: p.invalid_keys,
-      errorKeys: p.error_keys,
-      unknownKeys: p.unknown_keys,
-      enabledKeys: p.enabled_keys,
-    })),
-    keys: keys.map(k => ({
+    const keysFormatted = keys.map(k => ({
       id: k.id,
       platform: k.platform,
       label: k.label,
@@ -50,14 +72,19 @@ healthRouter.get('/', (_req: Request, res: Response) => {
       enabled: k.enabled === 1,
       createdAt: k.created_at,
       lastCheckedAt: k.last_checked_at,
-    })),
-  });
+    }));
+
+    res.json({ platforms, keys: keysFormatted });
+  } catch (error) {
+    console.error('Error fetching health status:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch health status' } });
+  }
 });
 
 // Check a specific key
 healthRouter.post('/check/:keyId', async (req: Request, res: Response) => {
-  const keyId = parseInt(req.params.keyId as string, 10);
-  if (isNaN(keyId)) {
+  const keyId = String(req.params.keyId);
+  if (!keyId) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
     return;
   }
@@ -67,7 +94,12 @@ healthRouter.post('/check/:keyId', async (req: Request, res: Response) => {
 });
 
 // Check all keys
-healthRouter.post('/check-all', async (_req: Request, res: Response) => {
-  await checkAllKeys();
+healthRouter.post('/check-all', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
+  await checkAllKeys(user.userId);
   res.json({ success: true });
 });

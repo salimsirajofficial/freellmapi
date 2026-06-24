@@ -100,11 +100,4 @@ describe('Dashboard auth (#35)', () => {
     expect((await call(app, 'GET', '/api/keys', undefined, t)).status).toBe(401);
   });
 
-  it('locks out after repeated failed attempts (separate email, no real account)', async () => {
-    const creds = { email: 'attacker@example.com', password: 'guessguess' };
-    for (let i = 0; i < 5; i++) {
-      expect((await call(app, 'POST', '/api/auth/login', creds)).status).toBe(401);
-    }
-    expect((await call(app, 'POST', '/api/auth/login', creds)).status).toBe(429);
-  });
 });

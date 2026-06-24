@@ -7,7 +7,7 @@ import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel,
 import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
 import { pruneRequestAnalytics } from '../services/request-retention.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
-import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { findUserIdByUnifiedApiKey, getDistinctModelsForList, getEnabledModelByModelId, insertRequest } from '../db/supabase-queries.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
@@ -56,7 +56,7 @@ export function extractApiToken(req: Request): string | undefined {
 // Sticky sessions: track which model served each "session"
 // Key: hash of first user message → model_db_id
 // This prevents model switching mid-conversation which causes hallucination
-const stickySessionMap = new Map<string, { modelDbId: number; lastUsed: number }>();
+const stickySessionMap = new Map<string, { modelDbId: string; lastUsed: number }>();
 const STICKY_TTL_MS = 30 * 60 * 1000; // 30 min session TTL
 
 function getSessionKey(messages: ChatMessage[]): string {
@@ -70,7 +70,7 @@ function getSessionKey(messages: ChatMessage[]): string {
   return `${hash}:${messages.length > 2 ? 'multi' : 'single'}`;
 }
 
-export function getStickyModel(messages: ChatMessage[]): number | undefined {
+export function getStickyModel(messages: ChatMessage[]): string | undefined {
   // Only apply sticky for multi-turn (has assistant messages = continuation)
   const hasAssistant = messages.some(m => m.role === 'assistant');
   if (!hasAssistant) return undefined;
@@ -88,7 +88,7 @@ export function getStickyModel(messages: ChatMessage[]): number | undefined {
   return entry.modelDbId;
 }
 
-export function setStickyModel(messages: ChatMessage[], modelDbId: number) {
+export function setStickyModel(messages: ChatMessage[], modelDbId: string) {
   const key = getSessionKey(messages);
   if (!key) return;
   stickySessionMap.set(key, { modelDbId, lastUsed: Date.now() });
@@ -102,30 +102,21 @@ export function setStickyModel(messages: ChatMessage[], modelDbId: number) {
   }
 }
 
-// OpenAI-compatible /models endpoint (used by Hermes for metadata)
-proxyRouter.get('/models', (req: Request, res: Response) => {
+async function authenticateProxyUser(req: Request): Promise<string | null> {
   const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  if (!token) return null;
+  return findUserIdByUnifiedApiKey(token);
+}
+
+// OpenAI-compatible /models endpoint (used by Hermes for metadata)
+proxyRouter.get('/models', async (req: Request, res: Response) => {
+  const userId = await authenticateProxyUser(req);
+  if (!userId) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
 
-  const db = getDb();
-  const models = db.prepare(`
-    SELECT platform, model_id, display_name, context_window
-    FROM (
-      SELECT platform, model_id, display_name, context_window, intelligence_rank, id,
-             ROW_NUMBER() OVER (
-               PARTITION BY model_id
-               ORDER BY intelligence_rank ASC, id ASC
-             ) AS rn
-      FROM models
-      WHERE enabled = 1
-    )
-    WHERE rn = 1
-    ORDER BY intelligence_rank ASC, id ASC
-  `).all() as ModelListRow[];
+  const models = await getDistinctModelsForList() as ModelListRow[];
 
   res.json({
     object: 'list',
@@ -339,9 +330,8 @@ const EmbeddingsBody = z.object({
 });
 
 proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  const userId = await authenticateProxyUser(req);
+  if (!userId) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
@@ -352,7 +342,7 @@ proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
   }
   const inputs = Array.isArray(parsed.data.input) ? parsed.data.input : [parsed.data.input];
   try {
-    const result = await runEmbeddings(parsed.data.model, inputs);
+    const result = await runEmbeddings(userId, parsed.data.model, inputs);
     res.json({
       object: 'list',
       data: result.vectors.map((values, i) => ({ object: 'embedding', index: i, embedding: values })),
@@ -373,9 +363,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Authenticate with the unified API key for every proxy request, including
   // loopback callers. Browser pages can reach localhost, so socket locality is
   // not a reliable authorization boundary.
-  const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  const userId = await authenticateProxyUser(req);
+  if (!userId) {
     res.status(401).json({
       error: { message: 'Invalid API key', type: 'authentication_error' },
     });
@@ -505,7 +494,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // rough per-image token cost so budget routing isn't skewed by content the
   // heuristic above (text-only) can't see.
   const hasImage = messageHasImage(messages);
-  if (hasImage && !hasEnabledVisionModel()) {
+  if (hasImage && !(await hasEnabledVisionModel(userId))) {
     res.status(422).json({
       error: {
         message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model (e.g. Gemini 2.5 Flash, Llama 4 Scout) in the Fallback Chain.',
@@ -526,7 +515,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // loop sees nothing, which is strictly worse than an error. Same up-front
   // gate pattern as vision above.
   const wantsTools = (tools?.length ?? 0) > 0;
-  if (wantsTools && !hasEnabledToolsModel()) {
+  if (wantsTools && !(await hasEnabledToolsModel(userId))) {
     res.status(422).json({
       error: {
         message: 'This request includes tools, but no tool-capable model is enabled. Enable a tool-calling model (e.g. GPT-OSS 120B, Gemini 3.5 Flash, GLM-4.7) in the Fallback Chain.',
@@ -541,18 +530,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // matching the requested id, return 400 — silently auto-routing to a
   // different model would be surprising to OpenAI-compatible clients.
   // Sticky-session is the fallback when no `model` field was sent at all.
-  let preferredModel: number | undefined;
+  let preferredModel: string | undefined;
   if (isAutoModel(requestedModel)) {
-    // Explicit "auto" → behave exactly like an omitted model field.
     preferredModel = getStickyModel(messages);
   } else if (requestedModel) {
-    const db = getDb();
-    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    const enabled = await getEnabledModelByModelId(requestedModel);
     if (enabled) {
       preferredModel = enabled.id;
     } else {
-      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
-      const reason = disabled ? 'is disabled' : 'is not in the catalog';
+      const reason = 'is not in the catalog or is disabled';
       res.status(400).json({
         error: {
           message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
@@ -578,7 +564,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools);
+      route = await routeRequest(userId, estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools);
     } catch (err: any) {
       // No more models available
       if (lastError) {
@@ -597,7 +583,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       return;
     }
 
-    recordRequest(route.platform, route.modelId, route.keyId);
+    await recordRequest(userId, route.platform, route.modelId, route.keyId);
 
     try {
       if (stream) {
@@ -639,9 +625,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // instead of handing the client a valid-looking empty stream
             // (production case: nemotron-3-super returning nothing on large
             // contexts while the request logs as success).
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (stream produced no chunks)', null, pinnedModelId);
+            await logRequest(userId, route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (stream produced no chunks)', null, pinnedModelId);
             skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-            setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+            await setCooldown(userId, route.platform, route.modelId, route.keyId, await getCooldownDurationForLimit(userId, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
             recordRateLimitHit(route.modelDbId);
             lastError = new Error(`empty completion from ${route.displayName}`);
             continue;
@@ -649,10 +635,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.write('data: [DONE]\n\n');
           res.end();
 
-          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
+          await recordTokens(userId, route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId);
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          await logRequest(userId, route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           return;
         } catch (streamErr: any) {
           if (streamStarted) {
@@ -664,7 +650,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), null, pinnedModelId);
+            await logRequest(userId, route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), null, pinnedModelId);
             return;
           }
           // Pre-stream error — bubble to outer retry/502 handler.
@@ -682,16 +668,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         const respMsg = result.choices?.[0]?.message;
         const respText = contentToString(respMsg?.content ?? '');
         if (!respText && (respMsg?.tool_calls?.length ?? 0) === 0) {
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId);
+          await logRequest(userId, route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId);
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          await setCooldown(userId, route.platform, route.modelId, route.keyId, await getCooldownDurationForLimit(userId, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
         }
 
         const totalTokens = result.usage?.total_tokens ?? 0;
-        recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
+        await recordTokens(userId, route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId);
 
@@ -712,8 +698,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // Normalize array-shaped message.content to a string on the way out (#166).
         res.json(normalizeOutboundContent(result));
 
-        logRequest(
-          route.platform, route.modelId, route.keyId, 'success',
+        await logRequest(
+          userId, route.platform, route.modelId, route.keyId, 'success',
           result.usage?.prompt_tokens ?? 0,
           result.usage?.completion_tokens ?? 0,
           Date.now() - start, null, null, pinnedModelId,
@@ -723,19 +709,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     } catch (err: any) {
       const latency = Date.now() - start;
       const safeError = sanitizeProviderErrorMessage(err.message);
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
+      await logRequest(userId, route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
 
       if (isRetryableError(err)) {
-        // Put this model+key on cooldown and try the next one
         const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
         skipKeys.add(skipId);
-        setCooldown(
+        await setCooldown(
+          userId,
           route.platform,
           route.modelId,
           route.keyId,
           isPaymentRequiredError(err)
             ? PAYMENT_REQUIRED_COOLDOWN_MS
-            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
+            : await getCooldownDurationForLimit(userId, route.platform, route.modelId, route.keyId, {
                 rpd: route.rpdLimit,
                 tpd: route.tpdLimit,
               }),
@@ -766,28 +752,35 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   });
 });
 
-export function logRequest(
+export async function logRequest(
+  userId: string,
   platform: string,
   modelId: string,
-  keyId: number,
+  keyId: string,
   status: string,
   inputTokens: number,
   outputTokens: number,
   latencyMs: number,
   error: string | null,
   ttfbMs: number | null = null,
-  // The model id the client pinned; null for auto-routed requests. Lets
-  // analytics split pinned vs auto traffic and detect failover overrides
-  // (requested_model set but != model_id).
   requestedModel: string | null = null,
 ) {
   try {
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel);
-    pruneRequestAnalytics({ db });
+    await insertRequest({
+      user_id: userId,
+      platform,
+      model_id: modelId,
+      key_id: keyId,
+      status,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      latency_ms: latencyMs,
+      error,
+      ttfb_ms: ttfbMs,
+      requested_model: requestedModel,
+      request_type: 'chat',
+    });
+    await pruneRequestAnalytics({ userId });
   } catch (e) {
     console.error('Failed to log request:', e);
   }

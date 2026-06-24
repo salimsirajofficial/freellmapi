@@ -41,12 +41,9 @@ COPY --from=build --chown=node:node /app/server/package.json ./server/package.js
 COPY --from=build --chown=node:node /app/server/dist ./server/dist
 COPY --from=build --chown=node:node /app/client/dist ./client/dist
 
-RUN mkdir -p /app/server/data && chown -R node:node /app/server/data
-
 USER node
 
 EXPOSE 3001
-VOLUME ["/app/server/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3001) + '/api/ping').then((res) => { if (!res.ok) process.exit(1); }).catch(() => process.exit(1));"

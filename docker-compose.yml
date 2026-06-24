@@ -13,8 +13,6 @@ services:
     # exposed to the internet. Set HOST_BIND=0.0.0.0 to reach it from your LAN.
     ports:
       - "${HOST_BIND:-127.0.0.1}:${PORT:-3001}:3001"
-    volumes:
-      - freellmapi-data:/app/server/data
     restart: unless-stopped
     healthcheck:
       test:
@@ -28,6 +26,3 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
-
-volumes:
-  freellmapi-data:

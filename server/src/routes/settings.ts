@@ -1,20 +1,50 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getDb, getUnifiedApiKey, regenerateUnifiedKey } from '../db/index.js';
-import { backupDbToPostgres } from '../db/postgres-sync.js';
+import { getUserSetting, setUserSetting } from '../db/supabase-queries.js';
+import crypto from 'crypto';
 
 export const settingsRouter = Router();
 
-// Get the unified API key
-settingsRouter.get('/api-key', (_req: Request, res: Response) => {
-  res.json({ apiKey: getUnifiedApiKey() });
+// Generate a unified API key
+function generateUnifiedKey(): string {
+  return 'freellmapi-' + crypto.randomBytes(32).toString('hex');
+}
+
+// Get the unified API key for the current user
+settingsRouter.get('/api-key', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
+
+  try {
+    let apiKey = await getUserSetting(user.userId, 'unified_api_key');
+    if (!apiKey) {
+      apiKey = generateUnifiedKey();
+      await setUserSetting(user.userId, 'unified_api_key', apiKey);
+    }
+    res.json({ apiKey });
+  } catch (error) {
+    console.error('Error fetching unified API key:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch API key' } });
+  }
 });
 
-// Regenerate the unified API key
-settingsRouter.post('/api-key/regenerate', async (_req: Request, res: Response) => {
-  const newKey = regenerateUnifiedKey();
-  await backupDbToPostgres(getDb(), 'unified api key regenerate').catch((err: any) => {
-    console.error('[postgres-sync] Immediate backup after unified API key regenerate failed:', err?.message || err);
-  });
-  res.json({ apiKey: newKey });
+// Regenerate the unified API key for the current user
+settingsRouter.post('/api-key/regenerate', async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  if (!user) {
+    res.status(401).json({ error: { message: 'Authentication required' } });
+    return;
+  }
+
+  try {
+    const newKey = generateUnifiedKey();
+    await setUserSetting(user.userId, 'unified_api_key', newKey);
+    res.json({ apiKey: newKey });
+  } catch (error) {
+    console.error('Error regenerating unified API key:', error);
+    res.status(500).json({ error: { message: 'Failed to regenerate API key' } });
+  }
 });
